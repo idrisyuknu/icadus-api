@@ -4,8 +4,17 @@ import csv
 from collections import Counter
 from typing import List, Optional
 
-app = FastAPI(title="Icadus MoodCinema API", version="1.1.0")
+app = FastAPI(title="Icadus MoodCinema API", version="1.2.0")
 DB_FILE = "global_movie_db.csv"
+
+# --- RUH HALİ HARİTASI (MOOD MAP) ---
+# Kullanıcının seçtiği modun, veritabanındaki hangi derin etiketlere denk geldiği
+MOOD_MAP = {
+    "melankolik": ["Existential", "Loneliness", "Melancholy", "Sad", "Slow Burn", "Philosophical", "Depressing", "Intimate"],
+    "eglenceli": ["Comedy", "Satire", "Humor", "Fun", "Adventure", "Fast Paced", "Witty", "Lighthearted"],
+    "gerilim": ["Thriller", "Horror", "Suspense", "Dark", "Crime", "Visceral", "Disturbing", "Mystery"],
+    "ilham": ["Hope", "Inspiring", "Redemption", "Human Spirit", "Touching", "Biographical", "Success"]
+}
 
 # --- SANAL KULLANICILAR ---
 BOTS = {
@@ -14,8 +23,10 @@ BOTS = {
     "@Sinefil_Cem": ["Amores Perros", "Requiem for a Dream", "The Apartment", "Taxi Driver", "Oldboy", "Parasite", "City of God"]
 }
 
+# Request Modeli güncellendi: Artık 'mood' parametresi de alıyor
 class MovieInput(BaseModel):
     selected_titles: List[str]
+    mood: str  # Yeni eklenen parametre (melankolik, eglenceli, gerilim, ilham)
 
 def load_database():
     movies = []
@@ -36,7 +47,7 @@ def calculate_similarity(user_titles, bot_titles):
 
 @app.get("/")
 def home():
-    return {"message": "Icadus API v1.1 (Visual Update) is Running! 🚀"}
+    return {"message": "Icadus API v1.2 (Mood Edition) is Running! 🧠"}
 
 @app.get("/search")
 def search_movie(query: str):
@@ -49,6 +60,8 @@ def search_movie(query: str):
 @app.post("/recommend")
 def get_recommendations(data: MovieInput):
     selected_titles = data.selected_titles
+    selected_mood = data.mood.lower()
+    
     selected_movies = [m for m in db_movies if m['Title'] in selected_titles]
     selected_ids = [m['TMDb ID'] for m in selected_movies]
     
@@ -71,29 +84,48 @@ def get_recommendations(data: MovieInput):
         for tag in m['Deep Tags'].split(','):
             profile[tag.strip()] += 1
 
-    # 3. ÖNERİ
+    # 3. MOOD FİLTRESİ HAZIRLIĞI
+    target_tags = MOOD_MAP.get(selected_mood, [])
+
+    # 4. ÖNERİ HESAPLAMA
     recommendations = []
     for m in db_movies:
         if m['TMDb ID'] in selected_ids: continue
         
-        content_score = 0
         movie_tags = [t.strip() for t in m['Deep Tags'].split(',')]
+        
+        # A. İçerik Skoru
+        content_score = 0
         matched = [t for t in movie_tags if t in profile]
         for t in matched: content_score += profile[t]
         
+        # B. Sosyal Skor
         social_score = 50 if m['Title'] in soul_mate_movies else 0
-        final_score = (content_score * 2) + social_score
         
-        if final_score > 0:
-            reason = f"Matches: {', '.join(matched[:3])}"
-            if social_score > 0: reason = f"🌟 {best_bot} loves this! " + reason
+        # C. MOOD BONUSU (Kritik Kısım)
+        # Eğer film, kullanıcının seçtiği mood'a uygun etiketler içeriyorsa dev bonus alır.
+        mood_bonus = 0
+        mood_matches = [t for t in movie_tags if any(mt in t for mt in target_tags)]
+        
+        if mood_matches:
+            mood_bonus = 100 * len(mood_matches) # Her mood etiketi için 100 puan!
+        
+        # Final Skor
+        final_score = content_score + social_score + mood_bonus
+        
+        # Sadece mood'a uyanları veya çok yüksek skorlu olanları al
+        if final_score > 50: 
+            reason = ""
+            if mood_bonus > 0: reason = f"🎯 Fits your '{selected_mood}' mood. "
+            elif social_score > 0: reason = f"🌟 {best_bot} loves this! "
+            else: reason = f"Matches: {', '.join(matched[:3])}"
             
             recommendations.append({
                 "title": m['Title'],
                 "year": m['Year'],
                 "score": final_score,
                 "overview": m['Overview'],
-                "poster_url": m.get('Poster URL', ''), # YENİ EKLENDİ
+                "poster_url": m.get('Poster URL', ''),
                 "reason": reason
             })
 
