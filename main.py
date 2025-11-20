@@ -3,12 +3,12 @@ from pydantic import BaseModel
 import csv
 from collections import Counter
 from typing import List, Optional
+import random
 
-app = FastAPI(title="Icadus MoodCinema API", version="1.2.0")
+app = FastAPI(title="Icadus MoodCinema API", version="2.0.0")
 DB_FILE = "global_movie_db.csv"
 
-# --- RUH HALİ HARİTASI (MOOD MAP) ---
-# Kullanıcının seçtiği modun, veritabanındaki hangi derin etiketlere denk geldiği
+# --- MOOD MAP ---
 MOOD_MAP = {
     "melankolik": ["Existential", "Loneliness", "Melancholy", "Sad", "Slow Burn", "Philosophical", "Depressing", "Intimate"],
     "eglenceli": ["Comedy", "Satire", "Humor", "Fun", "Adventure", "Fast Paced", "Witty", "Lighthearted"],
@@ -16,17 +16,12 @@ MOOD_MAP = {
     "ilham": ["Hope", "Inspiring", "Redemption", "Human Spirit", "Touching", "Biographical", "Success"]
 }
 
-# --- SANAL KULLANICILAR ---
-BOTS = {
-    "@Mainstream_Mark": ["Avengers: Endgame", "Avatar", "Titanic", "The Dark Knight", "Inception", "Joker"],
-    "@Romantik_Selin": ["The Notebook", "Pride & Prejudice", "La La Land", "Titanic", "Amélie"],
-    "@Sinefil_Cem": ["Amores Perros", "Requiem for a Dream", "The Apartment", "Taxi Driver", "Oldboy", "Parasite", "City of God"]
-}
-
-# Request Modeli güncellendi: Artık 'mood' parametresi de alıyor
-class MovieInput(BaseModel):
-    selected_titles: List[str]
-    mood: str  # Yeni eklenen parametre (melankolik, eglenceli, gerilim, ilham)
+# --- MODEL ---
+class FeedInput(BaseModel):
+    seed_movies: List[str]       # Başlangıçta seçilen 5 film
+    rated_movies: List[str]      # Akışta beğenilen (4-5 puan) filmler
+    viewed_ids: List[str]        # Daha önce gösterilenlerin ID'si (Tekrar etmesin)
+    mood: str
 
 def load_database():
     movies = []
@@ -39,16 +34,6 @@ def load_database():
 
 db_movies = load_database()
 
-def calculate_similarity(user_titles, bot_titles):
-    u_set = set(user_titles)
-    b_set = set(bot_titles)
-    if not u_set.union(b_set): return 0.0
-    return len(u_set.intersection(b_set)) / len(u_set.union(b_set))
-
-@app.get("/")
-def home():
-    return {"message": "Icadus API v1.2 (Mood Edition) is Running! 🧠"}
-
 @app.get("/search")
 def search_movie(query: str):
     results = []
@@ -57,70 +42,46 @@ def search_movie(query: str):
             results.append({"title": m['Title'], "year": m['Year'], "id": m['TMDb ID']})
     return results[:10]
 
-@app.post("/recommend")
-def get_recommendations(data: MovieInput):
-    selected_titles = data.selected_titles
-    selected_mood = data.mood.lower()
+@app.post("/next_batch")
+def get_next_batch(data: FeedInput):
+    """Sonsuz akış için sıradaki 5 filmi getirir."""
     
-    selected_movies = [m for m in db_movies if m['Title'] in selected_titles]
-    selected_ids = [m['TMDb ID'] for m in selected_movies]
+    # 1. KULLANICI PROFİLİNİ OLUŞTUR (Başlangıç + Son Beğenilenler)
+    active_list = data.seed_movies + data.rated_movies
+    active_movies = [m for m in db_movies if m['Title'] in active_list]
     
-    if not selected_movies:
-        raise HTTPException(status_code=404, detail="Film bulunamadı.")
-
-    # 1. SOSYAL SKOR
-    best_bot = None
-    highest_sim = 0
-    for bot_name, bot_favs in BOTS.items():
-        score = calculate_similarity(selected_titles, bot_favs)
-        if score > highest_sim:
-            highest_sim = score
-            best_bot = bot_name
-    soul_mate_movies = BOTS[best_bot] if best_bot and highest_sim > 0.1 else []
-
-    # 2. PROFİL
     profile = Counter()
-    for m in selected_movies:
-        for tag in m['Deep Tags'].split(','):
+    for m in active_movies:
+        tags = m['Deep Tags'].split(',')
+        for tag in tags:
             profile[tag.strip()] += 1
 
-    # 3. MOOD FİLTRESİ HAZIRLIĞI
-    target_tags = MOOD_MAP.get(selected_mood, [])
-
-    # 4. ÖNERİ HESAPLAMA
+    target_tags = MOOD_MAP.get(data.mood.lower(), [])
+    
+    # 2. ADAYLARI PUANLA
     recommendations = []
+    
     for m in db_movies:
-        if m['TMDb ID'] in selected_ids: continue
+        # Daha önce izlendiyse atla
+        if m['TMDb ID'] in data.viewed_ids: continue
         
         movie_tags = [t.strip() for t in m['Deep Tags'].split(',')]
         
-        # A. İçerik Skoru
-        content_score = 0
-        matched = [t for t in movie_tags if t in profile]
-        for t in matched: content_score += profile[t]
+        # A. Profil Uyumu
+        profile_score = sum([profile[t] for t in movie_tags if t in profile])
         
-        # B. Sosyal Skor
-        social_score = 50 if m['Title'] in soul_mate_movies else 0
+        # B. Mood Uyumu (Çok Önemli)
+        mood_score = sum([10 for t in movie_tags if any(mt in t for mt in target_tags)])
         
-        # C. MOOD BONUSU (Kritik Kısım)
-        # Eğer film, kullanıcının seçtiği mood'a uygun etiketler içeriyorsa dev bonus alır.
-        mood_bonus = 0
-        mood_matches = [t for t in movie_tags if any(mt in t for mt in target_tags)]
+        final_score = (profile_score * 2) + mood_score
         
-        if mood_matches:
-            mood_bonus = 100 * len(mood_matches) # Her mood etiketi için 100 puan!
-        
-        # Final Skor
-        final_score = content_score + social_score + mood_bonus
-        
-        # Sadece mood'a uyanları veya çok yüksek skorlu olanları al
-        if final_score > 50: 
-            reason = ""
-            if mood_bonus > 0: reason = f"🎯 Fits your '{selected_mood}' mood. "
-            elif social_score > 0: reason = f"🌟 {best_bot} loves this! "
-            else: reason = f"Matches: {', '.join(matched[:3])}"
+        if final_score > 0:
+            # Neden önerildi?
+            matched = [t for t in movie_tags if t in profile]
+            reason = f"Tags: {', '.join(matched[:2])}"
             
             recommendations.append({
+                "id": m['TMDb ID'],
                 "title": m['Title'],
                 "year": m['Year'],
                 "score": final_score,
@@ -129,5 +90,11 @@ def get_recommendations(data: MovieInput):
                 "reason": reason
             })
 
+    # 3. SIRALA VE KARIŞTIR (Hep aynılar gelmesin diye biraz randomness)
     recommendations.sort(key=lambda x: x['score'], reverse=True)
-    return {"soul_mate": best_bot, "recommendations": recommendations[:10]}
+    
+    # En iyi 50 tanesinden rastgele 5 tane seç (Çeşitlilik için)
+    top_pool = recommendations[:50]
+    random.shuffle(top_pool)
+    
+    return top_pool[:5]
