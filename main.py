@@ -2,18 +2,17 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import csv
 from collections import Counter
-from typing import List, Optional
+from typing import List, Dict
 import random
 
-app = FastAPI(title="Icadus API v2.1", version="2.1.0")
+app = FastAPI(title="Icadus API v3.0", version="3.0.0")
 DB_FILE = "global_movie_db.csv"
 
 # --- MODEL ---
 class FeedInput(BaseModel):
-    seed_movies: List[str]       # Elle arayıp eklenenler
-    rated_movies: List[str]      # Akışta beğenilenler (4-5 Puan)
-    disliked_movies: List[str]   # Beğenilmeyenler (1-2 Puan)
-    viewed_ids: List[str]        # Görüntülenen ID'ler
+    # Örn: {"Matrix": 5, "Barbie": 1}
+    rated_movies: Dict[str, int] 
+    viewed_ids: List[str]
 
 def load_database():
     movies = []
@@ -26,37 +25,8 @@ def load_database():
 
 db_movies = load_database()
 
-# --- YARDIMCI FONKSİYONLAR ---
-def calculate_match_percentage(movie_tags, user_profile):
-    """
-    Skoru 0-100 arası bir yüzdeye çevirir.
-    """
-    if not user_profile: return 0 # Profil yoksa 0
-    
-    match_score = 0
-    total_possible = sum(user_profile.values()) # Profildeki toplam ağırlık
-    
-    matched_tags = []
-    for tag in movie_tags:
-        if tag in user_profile:
-            weight = user_profile[tag]
-            match_score += weight
-            matched_tags.append(tag)
-            
-    # Matematiksel Normalizasyon (Logaritmik büyüme yerine lineer yaklaşım)
-    # Eğer kullanıcının sevdiği etiketlerin %30'u bu filmde varsa, bu %80+ bir uyumdur.
-    if total_possible == 0: return 0
-    
-    raw_percentage = (match_score / total_possible) * 100
-    
-    # Boost (Puanı biraz şişiriyoruz ki kullanıcı motive olsun)
-    final_percentage = min(98, raw_percentage * 3.5) 
-    
-    return int(final_percentage), matched_tags
-
 @app.get("/")
-def home():
-    return {"message": "Icadus Brain 2.1 is Active 🧠"}
+def home(): return {"msg": "Icadus 3.0 Ready"}
 
 @app.get("/search")
 def search_movie(query: str):
@@ -68,67 +38,76 @@ def search_movie(query: str):
 
 @app.post("/next_batch")
 def get_next_batch(data: FeedInput):
-    # 1. KULLANICI PROFİLİ (SÜREKLİ GÜNCELLENEN KİMLİK)
-    # Son beğenilenlerin ağırlığı daha fazla olsun (x2)
+    # 1. KULLANICI PROFİLİNİ OLUŞTUR (Ağırlıklı)
     profile = Counter()
+    positive_votes_count = 0
     
-    # Elle seçilenler
-    for title in data.seed_movies:
+    for title, score in data.rated_movies.items():
         movie = next((m for m in db_movies if m['Title'] == title), None)
         if movie:
-            for tag in movie['Deep Tags'].split(','): profile[tag.strip()] += 1
+            # Puanlama Mantığı:
+            # 5 Puan -> +3 Ağırlık (Çok Seviyor)
+            # 4 Puan -> +1 Ağırlık (Seviyor)
+            # 3 Puan -> 0 (Nötr)
+            # 2 Puan -> -1 (Sevmiyor)
+            # 1 Puan -> -3 (Nefret Ediyor - Cezalandır)
+            weight = 0
+            if score == 5: weight = 3
+            elif score == 4: weight = 1
+            elif score == 2: weight = -1
+            elif score == 1: weight = -3
             
-    # Akışta beğenilenler (Daha değerli)
-    for title in data.rated_movies:
-        movie = next((m for m in db_movies if m['Title'] == title), None)
-        if movie:
-            for tag in movie['Deep Tags'].split(','): profile[tag.strip()] += 2 # x2 Ağırlık
+            if score >= 4: positive_votes_count += 1
 
-    # 2. SOĞUK BAŞLANGIÇ (HİÇ VERİ YOKSA)
-    if not profile:
-        # Rastgele ama kaliteli 5 film getir (Mix)
-        candidates = [m for m in db_movies if m['TMDb ID'] not in data.viewed_ids]
-        selected = random.sample(candidates, min(5, len(candidates)))
-        
-        response_list = []
-        for m in selected:
-            response_list.append({
-                "id": m['TMDb ID'],
-                "title": m['Title'],
-                "year": m['Year'],
-                "score": 0, # Profil yoksa skor yok
-                "overview": m['Overview'],
-                "poster_url": m.get('Poster URL', ''),
-                "reason": "Start rating to build your DNA!"
-            })
-        return response_list
+            for tag in movie['Deep Tags'].split(','):
+                profile[tag.strip()] += weight
 
-    # 3. ADAYLARI PUANLA (PROFİL VARSA)
+    # 2. KANAAT GETİRME (CALIBRATION CHECK)
+    # Kullanıcı en az 5 filme yüksek puan (4-5) verdiyse algoritma kendine güvenir.
+    is_calibrated = positive_votes_count >= 5
+
+    # 3. ADAYLARI PUANLA
     recommendations = []
     for m in db_movies:
+        # TEKRAR YOK: Daha önce görülenleri kesinlikle ele
         if m['TMDb ID'] in data.viewed_ids: continue
-        if m['Title'] in data.disliked_movies: continue # Sevmediği filmleri ele
         
-        movie_tags = [t.strip() for t in m['Deep Tags'].split(',')]
-        
-        score, matched_tags = calculate_match_percentage(movie_tags, profile)
-        
-        if score > 0:
-            recommendations.append({
-                "id": m['TMDb ID'],
-                "title": m['Title'],
-                "year": m['Year'],
-                "score": score,
-                "overview": m['Overview'],
-                "poster_url": m.get('Poster URL', ''),
-                "reason": f"Matches: {', '.join(matched_tags[:2])}"
-            })
+        # Eğer profilde veri yoksa rastgele puan ata (Keşif modu)
+        if not profile:
+            final_score = random.randint(1, 50)
+        else:
+            movie_tags = [t.strip() for t in m['Deep Tags'].split(',')]
+            
+            # Etiket uyumunu hesapla
+            match_score = sum([profile[t] for t in movie_tags if t in profile])
+            
+            # Normalizasyon (Skoru 0-100 arasına yay)
+            # Basit bir sigmoid benzeri mantık
+            final_score = max(0, min(100, match_score * 5))
 
-    # Skora göre sırala ama araya biraz sürpriz (serendipity) kat
-    recommendations.sort(key=lambda x: x['score'], reverse=True)
-    
-    # En iyi 20 taneden 5 tane seç (Sürekli aynıları dönmesin)
-    top_pool = recommendations[:20]
-    random.shuffle(top_pool)
-    
-    return top_pool[:5]
+        recommendations.append({
+            "id": m['TMDb ID'],
+            "title": m['Title'],
+            "year": m['Year'],
+            "score": final_score,
+            "overview": m['Overview'],
+            "poster_url": m.get('Poster URL', ''),
+            "reason": "Based on your DNA"
+        })
+
+    # 4. SIRALAMA STRATEJİSİ
+    if is_calibrated:
+        # Kanaat oluştuysa: EN YÜKSEK PUANLIYI getir (Risk alma)
+        recommendations.sort(key=lambda x: x['score'], reverse=True)
+        # En tepedeki 5 taneyi al
+        final_batch = recommendations[:5]
+    else:
+        # Kanaat oluşmadıysa: KARIŞIK getir (Farklı türleri dene ki öğrensin)
+        # Biraz yüksek puanlı, biraz rastgele
+        top_recs = sorted(recommendations, key=lambda x: x['score'], reverse=True)[:50]
+        final_batch = random.sample(top_recs, min(5, len(top_recs)))
+
+    return {
+        "is_calibrated": is_calibrated, # Mobil uygulama bunu dinleyecek
+        "movies": final_batch
+    }
